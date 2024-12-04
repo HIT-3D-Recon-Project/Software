@@ -5,6 +5,7 @@ from PyQt5.QtCore import QThread, QObject, pyqtSignal
 import numpy as np
 import open3d as o3d
 from PIL import Image
+from sklearn.neighbors import NearestNeighbors
 
 class ReconstructionWorker(QObject):
     progress = pyqtSignal(int)
@@ -87,8 +88,7 @@ class ReconstructionWorker(QObject):
 
             self.log.emit(f"Using MiDaS model: dpt_swin2_large_384")
             
-            # 构建运行命令
-            # 在Windows上，我们需要使用conda run命令在特定环境中执行Python脚本
+
             command = [
                 "conda", "run", "-n", "midas-py310",
                 "python", midas_script,
@@ -454,6 +454,38 @@ class ReconstructionWorker(QObject):
         except Exception as e:
             raise Exception(f"Error during OpenMVS processing: {str(e)}")
 
+    def normalize_point_cloud(self, pcd):
+        """归一化点云"""
+        bbox = pcd.get_axis_aligned_bounding_box()
+        diagonal_length = np.linalg.norm(bbox.get_max_bound() - bbox.get_min_bound())
+        scale = 1.0 / diagonal_length
+        center = bbox.get_center()
+        
+        normalized_pcd = o3d.geometry.PointCloud(pcd)
+        points = np.asarray(normalized_pcd.points)
+        points = points - center
+        points = points * scale
+        normalized_pcd.points = o3d.utility.Vector3dVector(points)
+        
+        if hasattr(pcd, 'colors') and len(pcd.colors) > 0:
+            normalized_pcd.colors = pcd.colors
+        
+        return normalized_pcd, scale, center
+
+    def transfer_colors(self, source_pcd, target_pcd, k=3):
+        """将源点云的颜色转移到目标点云"""
+        source_points = np.asarray(source_pcd.points)
+        source_colors = np.asarray(source_pcd.colors)
+        target_points = np.asarray(target_pcd.points)
+        
+        nbrs = NearestNeighbors(n_neighbors=k, algorithm='auto').fit(source_points)
+        distances, indices = nbrs.kneighbors(target_points)
+        
+        target_colors = np.mean(source_colors[indices], axis=1)
+        target_pcd.colors = o3d.utility.Vector3dVector(target_colors)
+        
+        return target_pcd
+
     def merge_all_point_clouds(self):
         """融合MiDaS和OpenMVS生成的点云"""
         self.log.emit("开始融合点云...")
@@ -475,9 +507,16 @@ class ReconstructionWorker(QObject):
             
             self.log.emit(f"OpenMVS点云包含 {len(target_pcd.points)} 个点")
             
+            # 设置不同的体素大小
+            source_voxel_size = 0.005  # MiDaS点云使用更小的体素大小
+            target_voxel_size = 0.01   # OpenMVS点云使用较小的体素大小
+            registration_voxel_size = 0.02  # 用于配准的体素大小
+            
+            # 归一化OpenMVS点云
+            target_normalized, target_scale, target_center = self.normalize_point_cloud(target_pcd)
+            
             # 存储所有配准后的点云
             aligned_clouds = []
-            voxel_size = 0.05  # 初始体素大小
             
             # 读取并配准每个MiDaS点云
             for cloud_file in midas_clouds:
@@ -489,34 +528,46 @@ class ReconstructionWorker(QObject):
                         continue
                     
                     self.log.emit(f"处理点云 {cloud_file} (包含 {len(source_pcd.points)} 个点)")
-                        
-                    # 预处理点云
-                    source_pcd_down, source_fpfh = preprocess_point_cloud(source_pcd, voxel_size)
-                    target_pcd_down, target_fpfh = preprocess_point_cloud(target_pcd, voxel_size)
                     
-                    self.log.emit(f"下采样后点数: {len(source_pcd_down.points)}")
+                    # 归一化MiDaS点云
+                    source_normalized, source_scale, source_center = self.normalize_point_cloud(source_pcd)
                     
-                    # 粗配准
-                    result_icp = global_registration_with_icp(source_pcd, target_pcd, voxel_size)
+                    # 预处理点云用于配准
+                    source_down, source_fpfh = preprocess_point_cloud(source_normalized, registration_voxel_size)
+                    target_down, target_fpfh = preprocess_point_cloud(target_normalized, registration_voxel_size)
                     
-                    # 评估粗配准结果
-                    fitness = result_icp.fitness
-                    rmse = result_icp.inlier_rmse
-                    self.log.emit(f"粗配准结果 - 匹配度: {fitness:.4f}, RMSE: {rmse:.4f}")
+                    self.log.emit(f"下采样后点数: {len(source_down.points)}")
+                    
+                    # 全局配准
+                    result_ransac = execute_global_registration(
+                        source_down, target_down, source_fpfh, target_fpfh, registration_voxel_size
+                    )
+                    
+                    # 评估全局配准结果
+                    fitness = result_ransac.fitness
+                    rmse = result_ransac.inlier_rmse
+                    self.log.emit(f"全局配准结果 - 匹配度: {fitness:.4f}, RMSE: {rmse:.4f}")
                     
                     # 精细配准
-                    result_refined = refine_registration_with_adaptive_threshold(
-                        source_pcd, target_pcd, result_icp.transformation, voxel_size
+                    result_icp = refine_registration(
+                        source_normalized, target_normalized, result_ransac, registration_voxel_size
                     )
                     
                     # 评估精细配准结果
-                    fitness_refined = result_refined.fitness
-                    rmse_refined = result_refined.inlier_rmse
+                    fitness_refined = result_icp.fitness
+                    rmse_refined = result_icp.inlier_rmse
                     self.log.emit(f"精细配准结果 - 匹配度: {fitness_refined:.4f}, RMSE: {rmse_refined:.4f}")
                     
                     # 转换点云
-                    transformed_pcd = source_pcd.transform(result_refined.transformation)
-                    aligned_clouds.append(transformed_pcd)
+                    source_normalized.transform(result_icp.transformation)
+                    
+                    # 转移颜色信息（如果OpenMVS点云有颜色）
+                    if hasattr(target_normalized, 'colors') and len(target_normalized.colors) > 0:
+                        source_normalized = self.transfer_colors(target_normalized, source_normalized)
+                    
+                    # 对MiDaS点云进行轻度下采样
+                    source_down = source_normalized.voxel_down_sample(source_voxel_size)
+                    aligned_clouds.append(source_down)
                     self.log.emit(f"成功配准点云: {cloud_file}")
                     
                 except Exception as e:
@@ -526,40 +577,28 @@ class ReconstructionWorker(QObject):
             if not aligned_clouds:
                 raise Exception("没有可用的配准点云")
             
-            # 添加目标点云
-            aligned_clouds.append(target_pcd)
+            # 对OpenMVS点云进行下采样
+            target_down = target_normalized.voxel_down_sample(target_voxel_size)
+            aligned_clouds.append(target_down)
             
             # 合并所有点云
+            combined_pcd = aligned_clouds[0]
+            for cloud in aligned_clouds[1:]:
+                combined_pcd += cloud
+            
+            # 还原到原始尺度
+            points = np.asarray(combined_pcd.points)
+            points = points / target_scale  # 使用OpenMVS点云的尺度
+            points = points + target_center
+            combined_pcd.points = o3d.utility.Vector3dVector(points)
+            
+            # 保存结果
             output_path = os.path.join(self.output_folder, "final_merged_cloud.ply")
-            merged_pcd = merge_point_clouds(aligned_clouds, output_path)
-            self.log.emit(f"合并后点云包含 {len(merged_pcd.points)} 个点")
+            o3d.io.write_point_cloud(output_path, combined_pcd)
             
-            # 评估融合结果
-            evaluation_results = evaluate_point_clouds(merged_pcd, target_pcd, voxel_size)
+            self.log.emit(f"合并后点云包含 {len(combined_pcd.points)} 个点")
+            self.log.emit(f"点云已保存至: {output_path}")
             
-            # 输出评估结果
-            self.log.emit("\n点云融合评估结果:")
-            self.log.emit(f"RMSE: {evaluation_results['rmse']:.5f}")
-            self.log.emit(f"Hausdorff距离: {evaluation_results['hausdorff']:.5f}")
-            self.log.emit(f"重叠度: {evaluation_results['overlap']*100:.2f}%")
-            self.log.emit(f"点云密度比: {evaluation_results['density_ratio']:.2f}")
-            self.log.emit(f"点云分布均匀度: {evaluation_results['uniformity']:.2f}")
-            
-            # 保存评估报告
-            report_path = os.path.join(self.output_folder, "point_cloud_evaluation.txt")
-            with open(report_path, 'w') as f:
-                f.write("点云融合评估报告\n")
-                f.write("=" * 30 + "\n\n")
-                f.write(f"OpenMVS点云点数: {len(target_pcd.points)}\n")
-                f.write(f"融合后点云点数: {len(merged_pcd.points)}\n")
-                f.write(f"RMSE: {evaluation_results['rmse']:.5f}\n")
-                f.write(f"Hausdorff距离: {evaluation_results['hausdorff']:.5f}\n")
-                f.write(f"重叠度: {evaluation_results['overlap']*100:.2f}%\n")
-                f.write(f"点云密度比: {evaluation_results['density_ratio']:.2f}\n")
-                f.write(f"点云分布均匀度: {evaluation_results['uniformity']:.2f}\n")
-            
-            self.log.emit(f"评估报告已保存至: {report_path}")
-            self.log.emit("点云融合完成")
             return True
             
         except Exception as e:
@@ -583,62 +622,22 @@ def preprocess_point_cloud(pcd, voxel_size):
     )
     return pcd_down, fpfh
 
-def global_registration_with_icp(source, target, voxel_size):
-    source_down, source_fpfh = preprocess_point_cloud(source, voxel_size)
-    target_down, target_fpfh = preprocess_point_cloud(target, voxel_size)
+def execute_global_registration(source_down, target_down, source_fpfh, target_fpfh, voxel_size):
     distance_threshold = voxel_size * 1.5
+    result = o3d.registration.registration_ransac_based_on_feature_matching(
+        source_down, target_down, source_fpfh, target_fpfh, distance_threshold,
+        o3d.registration.TransformationEstimationPointToPoint(False), 4, [
+            o3d.registration.CorrespondenceCheckerBasedOnEdgeLength(0.9),
+            o3d.registration.CorrespondenceCheckerBasedOnDistance(distance_threshold)
+        ], o3d.registration.RANSACConvergenceCriteria(4000000, 5000)
+    )
+    return result
+
+def refine_registration(source, target, result_ransac, voxel_size):
+    distance_threshold = voxel_size * 0.4
     result_icp = o3d.registration.registration_icp(
-        source_down, target_down, distance_threshold,
-        np.eye(4),
+        source, target, distance_threshold, result_ransac.transformation,
         o3d.registration.TransformationEstimationPointToPoint(),
         o3d.registration.ICPConvergenceCriteria(max_iteration=2000)
     )
     return result_icp
-
-def refine_registration_with_adaptive_threshold(source, target, transformation, voxel_size):
-    distance_threshold = voxel_size * 0.4
-    result_refined = o3d.registration.registration_icp(
-        source, target, distance_threshold,
-        transformation,
-        o3d.registration.TransformationEstimationPointToPoint(),
-        o3d.registration.ICPConvergenceCriteria(max_iteration=2000)
-    )
-    return result_refined
-
-def merge_point_clouds(aligned_clouds, output_path):
-    merged_pcd = aligned_clouds[0]
-    for cloud in aligned_clouds[1:]:
-        merged_pcd += cloud
-    o3d.io.write_point_cloud(output_path, merged_pcd)
-    return merged_pcd
-
-def evaluate_point_clouds(merged_pcd, target_pcd, voxel_size):
-    """评估点云融合结果"""
-    # 计算点云距离
-    distances = merged_pcd.compute_point_cloud_distance(target_pcd)
-    distances = np.asarray(distances)
-    
-    # 计算RMSE
-    rmse = np.sqrt(np.mean(distances**2))
-    
-    # 计算Hausdorff距离
-    hausdorff = np.max(distances)
-    
-    # 计算重叠度
-    overlap_threshold = voxel_size * 2
-    overlap = np.mean(distances < overlap_threshold)
-    
-    # 计算点云密度比
-    density_ratio = len(merged_pcd.points) / len(target_pcd.points)
-    
-    # 计算点云分布均匀度
-    merged_pcd_down = merged_pcd.voxel_down_sample(voxel_size)
-    uniformity = len(merged_pcd_down.points) / len(merged_pcd.points)
-    
-    return {
-        'rmse': rmse,
-        'hausdorff': hausdorff,
-        'overlap': overlap,
-        'density_ratio': density_ratio,
-        'uniformity': uniformity
-    }
