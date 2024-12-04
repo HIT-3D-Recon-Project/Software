@@ -167,9 +167,6 @@ python main.py
 - `ComEva.py`：点云评估工具
 - `pointcloud_processing.py`：点云处理功能
 
-## 许可证
-
-[许可证信息]
 
 ## 贡献指南
 
@@ -181,6 +178,3 @@ python main.py
 4. 推送到分支
 5. 创建Pull Request
 
-## 联系方式
-
-[联系信息]
