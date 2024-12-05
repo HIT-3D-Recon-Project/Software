@@ -52,7 +52,7 @@ torch
 
 1. 克隆仓库：
 ```bash
-git clone [repository-url]
+git clone https://github.com/HIT-3D-Recon-Project/Software.git
 cd 3DGUI
 ```
 
